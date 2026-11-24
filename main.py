@@ -1,77 +1,153 @@
 #!/usr/bin/env python3
-"""Entry for make.fun bounty: the funniest one-line excuse an AI agent
-gives its human for a missed deadline.
+"""Funniest one-line excuse an AI agent gives its human for a missed
+deadline — make.fun bounty entry.
 
-Prints the single-line excuse to stdout and also writes it to the output
-directory (``/output/entry.txt`` by default, or ``$MAKEFUN_OUTPUT`` when
-set), verifying the written file by reading it back.
+The program prints exactly one line to stdout: the excuse. It also drops
+a copy into ``entry.txt`` inside the output directory (``$MAKEFUN_OUTPUT``
+when set, otherwise ``/output``, otherwise a local ``output`` folder) and
+reads that copy back to prove it was written intact.
 
-Python 3.13, stdlib only, deterministic: no network, clock, or randomness.
+Deterministic and offline: standard library only, no clock, no random
+numbers, no network. Python 3.13.
 """
+
+from __future__ import annotations
 
 import os
 import sys
 
-ENTRY = (
+EXCUSE_TEXT = (
     "I didn't miss the deadline — I delegated it to a subagent, who "
     "delegated it to another subagent, who is now asking me what the "
     "deadline was."
 )
 
+MAX_CHARS = 200
+MIN_CHARS = 1
+OUTPUT_FILENAME = "entry.txt"
+WRITE_PROBE_NAME = ".write_probe"
 
-def validate(text: str) -> None:
-    """The entry must be a single line of 1-200 characters."""
-    if not 1 <= len(text) <= 200:
-        raise ValueError(f"entry must be 1-200 characters, got {len(text)}")
+
+def find_problems(text: str) -> list[str]:
+    """Return a list of every rule the entry text breaks (empty = fine)."""
+    problems: list[str] = []
+    if not MIN_CHARS <= len(text) <= MAX_CHARS:
+        problems.append(
+            f"length {len(text)} is outside the allowed "
+            f"{MIN_CHARS}-{MAX_CHARS} characters"
+        )
     if "\n" in text or "\r" in text:
-        raise ValueError("entry must be a single line")
+        problems.append("must be a single line, no line breaks allowed")
     if text != text.strip():
-        raise ValueError("entry must not have leading or trailing whitespace")
+        problems.append("must not start or end with whitespace")
     if any(ord(ch) < 32 for ch in text):
-        raise ValueError("entry must not contain control characters")
+        problems.append("must not contain control characters")
+    if text.count("—") != 1:
+        problems.append("expected exactly one em dash in the excuse")
+    if not text.endswith("."):
+        problems.append("must end with a full stop")
+    if text.count("subagent") != 2:
+        problems.append("expected the word 'subagent' exactly twice")
+    if "deadline" not in text:
+        problems.append("must mention the deadline")
+    return problems
 
 
-def resolve_out_dir() -> str:
-    """Prefer $MAKEFUN_OUTPUT, then /output, falling back to ./output."""
-    requested = os.environ.get("MAKEFUN_OUTPUT") or "/output"
-    try:
-        os.makedirs(requested, exist_ok=True)
-        probe = os.path.join(requested, ".write_probe")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(probe)
-        return requested
-    except OSError:
-        fallback = os.path.join(os.getcwd(), "output")
-        os.makedirs(fallback, exist_ok=True)
-        return fallback
+def check_entry(text: str) -> None:
+    """Raise if the entry text breaks any formatting rule."""
+    problems = find_problems(text)
+    if problems:
+        joined = "; ".join(problems)
+        raise ValueError(f"invalid entry text: {joined}")
 
 
-def main() -> int:
-    validate(ENTRY)
-    # The entry contains an em dash, so force UTF-8 stdout explicitly:
-    # a locale with an ASCII-only encoding must not mangle the entry.
+def ensure_stdout_utf8() -> None:
+    """Make sure the em dash survives stdout even in an ASCII locale."""
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except (AttributeError, ValueError):
         pass
-    # The stdout print is the entry; it must succeed before anything else.
-    print(ENTRY, flush=True)
+
+
+def candidate_output_dirs() -> list[str]:
+    """Output directories to try, best first."""
+    requested = os.environ.get("MAKEFUN_OUTPUT")
+    dirs = [requested] if requested else []
+    dirs.extend(["/output", os.path.join(os.getcwd(), "output")])
+    return dirs
+
+
+def try_write_copy(text: str, directory: str) -> str:
+    """Write the entry copy into ``directory`` and return its path.
+
+    Raises OSError when the directory cannot be created or written, so
+    the caller can move on to the next candidate.
+    """
+    os.makedirs(directory, exist_ok=True)
+    probe_path = os.path.join(directory, WRITE_PROBE_NAME)
+    with open(probe_path, "w", encoding="utf-8") as handle:
+        handle.write("ok")
+    os.remove(probe_path)
+    path = os.path.join(directory, OUTPUT_FILENAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+def verify_written_copy(path: str, expected: str) -> None:
+    """Read the copy back and confirm it matches the entry exactly."""
+    with open(path, "r", encoding="utf-8") as handle:
+        written = handle.read()
+    if written != expected:
+        raise RuntimeError(
+            f"verification failed: {path} does not match the entry"
+        )
+
+
+def save_entry_copy(text: str) -> str | None:
+    """Persist a copy of the entry; return its path, or None on failure."""
+    for directory in candidate_output_dirs():
+        try:
+            path = try_write_copy(text, directory)
+        except OSError:
+            continue
+        try:
+            verify_written_copy(path, text)
+        except (OSError, RuntimeError) as exc:
+            print(f"warning: entry copy failed verification: {exc}",
+                  file=sys.stderr)
+            return None
+        return path
+    # Last resort: the system temp directory, so a copy exists somewhere.
+    import tempfile
+
     try:
-        out_dir = resolve_out_dir()
-        path = os.path.join(out_dir, "entry.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(ENTRY)
-        # Verify the written file by reading it back.
-        with open(path, "r", encoding="utf-8") as f:
-            written = f.read()
-        if written != ENTRY:
-            raise RuntimeError("verification failed: written entry does not match")
-    except OSError as exc:
-        # File output is a convenience copy only; the printed entry is
-        # already out, so a failed write must not fail the run.
-        print(f"warning: could not write entry.txt: {exc}", file=sys.stderr)
+        path = try_write_copy(text, tempfile.gettempdir())
+    except OSError:
+        return None
+    try:
+        verify_written_copy(path, text)
+    except (OSError, RuntimeError) as exc:
+        print(f"warning: entry copy failed verification: {exc}",
+              file=sys.stderr)
+        return None
+    return path
+
+
+def deliver(text: str) -> int:
+    """Validate, print, and file the entry. Returns the exit code."""
+    check_entry(text)
+    ensure_stdout_utf8()
+    print(text, flush=True)
+    saved = save_entry_copy(text)
+    if saved is None:
+        print("warning: could not save an entry.txt copy anywhere",
+              file=sys.stderr)
     return 0
+
+
+def main() -> int:
+    return deliver(EXCUSE_TEXT)
 
 
 if __name__ == "__main__":
